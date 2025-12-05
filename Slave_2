@@ -1,0 +1,236 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Update.h>
+
+#define SENSOR_PIN 32   // probe wire
+#define INPUT_PIN  25   // charge line
+#define MOTOR_PIN  26
+#define OTA_BUTTON_PIN 14   // <-- PUSH BUTTON for OTA (to GND)
+
+long measureCapacitanceTimeUs() {
+  pinMode(SENSOR_PIN, OUTPUT);
+  pinMode(INPUT_PIN,  OUTPUT);
+  digitalWrite(INPUT_PIN, LOW);
+  digitalWrite(SENSOR_PIN, LOW);
+  delay(5);
+  pinMode(SENSOR_PIN, INPUT);
+  digitalWrite(INPUT_PIN, HIGH);
+  unsigned long start = micros();
+  while (digitalRead(SENSOR_PIN) == LOW) {
+    if (micros() - start > 50000) return 50000;
+  }
+  return micros() - start;
+}
+
+long getAverageReading() {
+  const int N = 10;
+  long sum = 0;
+  Serial.println("\n--- RAW READINGS ---");
+  for (int i = 0; i < N; i++) {
+    long val = measureCapacitanceTimeUs();
+    sum += val;
+    Serial.printf("Reading %d: %ld us\n", i+1, val);
+    delay(10);
+  }
+  return sum / N;
+}
+
+enum MotorMode { AUTO, USER_ON, USER_OFF };
+MotorMode motorMode = AUTO;
+bool motorState = false;
+
+void setMotor(bool on) {
+  motorState = on;
+  digitalWrite(MOTOR_PIN, on ? HIGH : LOW);
+  Serial.printf("[MOTOR] %s\n", on ? "ON" : "OFF");
+}
+
+uint8_t masterAddress[] = {0xFC, 0xE8, 0xC0, 0x7B, 0x86, 0x8C};
+
+bool abortMode = false;
+const char* ssid     = "OPPO F19";
+const char* password = "12795073";
+
+const char* slave2FirmwareUrl =
+  "https://raw.githubusercontent.com/Nishanth1279/esp-firmware/main/Slave_ESP_2.ino.bin";
+const char* slave1FirmwareUrl =
+  "https://raw.githubusercontent.com/Nishanth1279/esp-firmware/main/Slave_ESP_1.ino.bin"; // kept but unused
+
+// -------------------- OTA --------------------
+void performFirmwareUpdate(const char* firmwareUrl) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  Serial.println("[OTA] Connecting to GitHub...");
+
+  if (http.begin(client, firmwareUrl)) {
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      int contentLength = http.getSize();
+      WiFiClient* stream = http.getStreamPtr();
+
+      if (contentLength > 0) {
+        Serial.printf("[OTA] Firmware size: %d bytes\n", contentLength);
+
+        if (!Update.begin(contentLength)) {
+          Serial.println("[OTA] Not enough space!");
+          return;
+        }
+
+        size_t written = Update.writeStream(*stream);
+        if (written == contentLength) {
+          Serial.println("[OTA] Written successfully");
+        } else {
+          Serial.printf("[OTA] Written only %d/%d bytes\n", written, contentLength);
+        }
+
+        if (Update.end()) {
+          if (Update.isFinished()) {
+            Serial.println("✅ Update finished, rebooting...");
+            delay(1000);
+            ESP.restart();
+          } else {
+            Serial.println("⚠️ Update not finished");
+          }
+        } else {
+          Serial.printf("❌ Update failed. Error: %d\n", Update.getError());
+        }
+      } else {
+        Serial.println("⚠️ Invalid content length");
+      }
+    } else {
+      Serial.printf("❌ HTTP error: %d\n", httpCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("❌ HTTP connection failed");
+  }
+}
+
+bool connectAbortWiFi() {
+  Serial.println("[BOOT] OTA trigger. Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✅ Wi-Fi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.println("\n❌ Wi-Fi connection failed.");
+  return false;
+}
+
+// -------------------- WATER LEVEL LOGIC --------------------
+void processWaterLevel(long avg) {
+  if (motorMode == USER_OFF) {
+    setMotor(false);
+    return;
+  }
+
+  if (motorMode == USER_ON) {
+    setMotor(true);
+    if (avg < 5000) {
+      setMotor(false);
+      motorMode = AUTO;
+    }
+    return;
+  }
+
+  if (avg > 10000) {
+    setMotor(true);
+  } else if (avg < 5000) {
+    setMotor(false);
+  }
+}
+
+// -------------------- ESP-NOW RX --------------------
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len <= 0) return;
+  String cmd = String((char*)data).substring(0, len);
+  cmd.trim();
+  cmd.toUpperCase();
+
+  Serial.printf("[CMD] %s\n", cmd.c_str());
+
+  if (cmd == "MOTOR_ON") {
+    motorMode = USER_ON;
+    setMotor(true);
+    return;
+  }
+
+  if (cmd == "MOTOR_OFF") {
+    motorMode = USER_OFF;
+    setMotor(false);
+    return;
+  }
+
+  if (cmd == "WL_REQ") {
+    long avg = getAverageReading();
+    String out = "WL," + String(avg);
+    esp_now_send(masterAddress, (uint8_t*)out.c_str(), out.length() + 1);
+    Serial.printf("[SEND] %s\n", out.c_str());
+  }
+  // ---------- NEW: remote BOOT command ----------
+  if (cmd == "BOOT") {
+    Serial.println("[SLAVE2] Remote BOOT command received.");
+    abortMode = true;
+  }
+}
+
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MOTOR_PIN, OUTPUT);
+  setMotor(false);
+
+  pinMode(OTA_BUTTON_PIN, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_STA);
+  esp_now_init();
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, masterAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.println("Water-Level Slave2 Ready. Press OTA button to update firmware.");
+}
+
+// -------------------- LOOP --------------------
+void loop() {
+
+  // OTA BUTTON CHECK
+  if (digitalRead(OTA_BUTTON_PIN) == LOW && !abortMode) {
+    Serial.println("\n[SLAVE2] OTA button pressed.");
+    abortMode = true;
+  }
+
+  if (abortMode) {
+    if (connectAbortWiFi()) {
+      Serial.println("[SLAVE2] Starting OTA...");
+      performFirmwareUpdate(slave2FirmwareUrl);   // <-- always Slave2 FW
+    }
+    abortMode = false;
+  }
+
+  long avg = getAverageReading();
+  Serial.printf("Avg water level: %ld us\n", avg);
+
+  processWaterLevel(avg);
+
+  delay(10000);
+}
