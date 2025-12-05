@@ -1,0 +1,278 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Update.h>
+
+#define PIRPIN 27
+#define IRPIN  26
+#define OTA_BUTTON_PIN 18   // <-- PUSH BUTTON for OTA (to GND)
+
+// -------------------- Data struct --------------------
+typedef struct struct_message {
+  float temperature;
+  float humidity;
+  int   ldrValue;
+  bool  fanState;
+  bool  lightState;
+} struct_message;
+
+struct_message incomingData;
+
+int lastPIR = -1;
+int lastIR  = -1;
+
+uint8_t slave1Address[] = {0xC8, 0xE2, 0x18, 0x67, 0x87, 0xB0};
+uint8_t slave2Address[] = {0xFC, 0xB4, 0x67, 0x4F, 0x16, 0x44};
+
+bool abortMode = false;
+const char* ssid     = "OPPO F19";
+const char* password = "12795073";
+
+const char* masterFirmwareUrl =
+  "https://raw.githubusercontent.com/Nishanth1279/esp-firmware/main/Master_ESP.ino.bin";
+
+// -------------------- OTA FUNCTION --------------------
+void performFirmwareUpdate(const char* firmwareUrl) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  Serial.println("[OTA] Connecting to GitHub...");
+
+  if (http.begin(client, firmwareUrl)) {
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      int contentLength = http.getSize();
+      WiFiClient *stream = http.getStreamPtr();
+
+      if (contentLength > 0) {
+        Serial.printf("[OTA] Firmware size: %d bytes\n", contentLength);
+
+        if (!Update.begin(contentLength)) {
+          Serial.println("[OTA] Not enough space!");
+          return;
+        }
+
+        size_t written = Update.writeStream(*stream);
+        if (written == contentLength) {
+          Serial.println("[OTA] Written successfully");
+        } else {
+          Serial.printf("[OTA] Written only %d/%d bytes\n", written, contentLength);
+        }
+
+        if (Update.end()) {
+          if (Update.isFinished()) {
+            Serial.println("✅ Update finished, rebooting...");
+            delay(1000);
+            ESP.restart();
+          } else {
+            Serial.println("⚠️ Update not finished");
+          }
+        } else {
+          Serial.printf("❌ Update failed. Error: %d\n", Update.getError());
+        }
+
+      } else {
+        Serial.println("⚠️ Invalid content length");
+      }
+    } else {
+      Serial.printf("❌ HTTP error: %d\n", httpCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("❌ HTTP connection failed");
+  }
+}
+
+bool connectAbortWiFi() {
+  Serial.println("[BOOT] OTA trigger. Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    Serial.print(".");
+    delay(500);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✅ Wi-Fi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+  Serial.println("\n❌ Wi-Fi connection failed.");
+  return false;
+}
+
+// -------------------- ESP-NOW RX --------------------
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+
+  // Slave-2 water level
+  if (len > 3 && data[0] == 'W' && data[1] == 'L' && data[2] == ',') {
+    String wl = String((char*)data).substring(3);
+    wl.trim();
+
+    Serial.printf("[MASTER] Received Water Level = %s\n", wl.c_str());
+    Serial2.printf("WATER,%s\n", wl.c_str());
+    return;
+  }
+
+  // Slave-1 data
+  if (len == sizeof(struct_message)) {
+    memcpy(&incomingData, data, sizeof(incomingData));
+
+    Serial2.printf("SLAVE,%.2f,%.2f,%d,%d,%d,%d,%d\n",
+                   incomingData.temperature,
+                   incomingData.humidity,
+                   incomingData.ldrValue,
+                   incomingData.fanState,
+                   incomingData.lightState,
+                   lastPIR >= 0 ? lastPIR : 0,
+                   lastIR  >= 0 ? lastIR  : 0);
+
+    Serial.printf("[MASTER] From SLAVE1 -> t=%.2f°C h=%.2f%% LDR=%d | Fan=%d Light=%d PIR=%d IR=%d\n",
+                  incomingData.temperature,
+                  incomingData.humidity,
+                  incomingData.ldrValue,
+                  incomingData.fanState,
+                  incomingData.lightState,
+                  lastPIR, lastIR);
+  }
+}
+
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+
+  WiFi.mode(WIFI_STA);
+
+  pinMode(PIRPIN, INPUT);
+  pinMode(IRPIN, INPUT);
+  pinMode(OTA_BUTTON_PIN, INPUT_PULLUP);   // button to GND
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_peer_info_t peer1 = {};
+  memcpy(peer1.peer_addr, slave1Address, 6);
+  peer1.channel = 0;
+  peer1.encrypt = false;
+  esp_now_add_peer(&peer1);
+
+  esp_now_peer_info_t peer2 = {};
+  memcpy(peer2.peer_addr, slave2Address, 6);
+  peer2.channel = 0;
+  peer2.encrypt = false;
+  esp_now_add_peer(&peer2);
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.println("[MASTER] Ready. Press OTA button for firmware update.");
+}
+
+// -------------------- LOOP --------------------
+void loop() {
+
+  // ---- OTA BUTTON CHECK ----
+  if (digitalRead(OTA_BUTTON_PIN) == LOW && !abortMode) {
+    Serial.println("\n[MASTER] OTA button pressed.");
+    abortMode = true;
+  }
+
+  if (abortMode) {
+    if (connectAbortWiFi()) {
+      Serial.println("[MASTER] Starting OTA...");
+      performFirmwareUpdate(masterFirmwareUrl);
+    }
+    abortMode = false;
+  }
+
+  // PIR / IR → ESP8266
+  int pirValue = digitalRead(PIRPIN);
+  int irValue  = digitalRead(IRPIN);
+
+  if (pirValue != lastPIR || irValue != lastIR) {
+    lastPIR = pirValue;
+    lastIR  = irValue;
+
+    Serial2.printf("PIRIR,%d,%d\n", pirValue, irValue);
+    Serial.printf("[MASTER] PIR/IR change sent → PIR=%d IR=%d\n", pirValue, irValue);
+  }
+
+  // UART from ESP8266
+  while (Serial2.available()) {
+    String line = Serial2.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    Serial.printf("[MASTER UART] '%s'\n", line.c_str());
+
+    // FAN/LIGHT commands → Slave1
+    if (line.startsWith("MASTER,LO") ||
+        line.startsWith("MASTER,LF") ||
+        line.startsWith("MASTER,FO") ||
+        line.startsWith("MASTER,FF") ||
+        line.startsWith("TH,")) {
+
+      String cmd = line.substring(line.indexOf(',') + 1);
+      esp_err_t r = esp_now_send(slave1Address,
+                                 (uint8_t*)cmd.c_str(),
+                                 cmd.length() + 1);
+      Serial.printf("[MASTER] → Slave1 CMD: %s (res=%d)\n", cmd.c_str(), r);
+    }
+
+    // WATER LEVEL REQUEST → Slave2
+    else if (line.equals("MASTER,WL_REQ")) {
+      const char* cmd = "WL_REQ";
+      esp_err_t r = esp_now_send(slave2Address,
+                                 (uint8_t*)cmd,
+                                 strlen(cmd) + 1);
+      Serial.printf("[MASTER] → Slave2: WL_REQ (res=%d)\n", r);
+    }
+
+    // MOTOR control → Slave2
+    else if (line.equals("MASTER,MOTOR_ON")) {
+      const char* cmd = "MOTOR_ON";
+      esp_err_t r = esp_now_send(slave2Address,
+                                 (uint8_t*)cmd,
+                                 strlen(cmd) + 1);
+      Serial.printf("[MASTER] → Slave2: MOTOR_ON (res=%d)\n", r);
+    }
+    else if (line.equals("MASTER,MOTOR_OFF")) {
+      const char* cmd = "MOTOR_OFF";
+      esp_err_t r = esp_now_send(slave2Address,
+                                 (uint8_t*)cmd,
+                                 strlen(cmd) + 1);
+      Serial.printf("[MASTER] → Slave2: MOTOR_OFF (res=%d)\n", r);
+    }
+
+    // ---------- NEW: BOOT commands ----------
+    else if (line.equals("MASTER,BOOT_MASTER")) {
+      Serial.println("[MASTER] Remote boot command received (self).");
+      abortMode = true;   // same path as button
+    }
+    else if (line.equals("MASTER,BOOT_S1")) {
+      const char* cmd = "BOOT";
+      esp_err_t r = esp_now_send(slave1Address,
+                                 (uint8_t*)cmd,
+                                 strlen(cmd) + 1);
+      Serial.printf("[MASTER] → Slave1: BOOT (res=%d)\n", r);
+    }
+    else if (line.equals("MASTER,BOOT_S2")) {
+      const char* cmd = "BOOT";
+      esp_err_t r = esp_now_send(slave2Address,
+                                 (uint8_t*)cmd,
+                                 strlen(cmd) + 1);
+      Serial.printf("[MASTER] → Slave2: BOOT (res=%d)\n", r);
+    }
+    // ----------------------------------------
+
+    else {
+      Serial.printf("[MASTER UART] Unknown: '%s'\n", line.c_str());
+    }
+  }
+
+  delay(50);
+}
