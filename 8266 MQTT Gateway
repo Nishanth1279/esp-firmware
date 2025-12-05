@@ -1,0 +1,242 @@
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+const char* ssid = "OPPO F19";
+const char* password = "12795073";
+const char* mqtt_server = "broker-cn.emqx.io";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+float temp = NAN, hum = NAN;
+int   ldr  = -1;
+int   pir  = 0, ir = 0;
+
+// Device status
+int fanStatus   = 0;
+int lightStatus = 0;
+
+unsigned long lastMsg = 0;
+#define MSG_BUFFER_SIZE 256
+char jsonMsg[MSG_BUFFER_SIZE];
+
+// -------------- Wi-Fi Setup --------------
+void setup_wifi() {
+  delay(10);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected");
+}
+
+// -------------- Publish water level --------------
+void publishWaterLevel(long levelRaw) {
+  StaticJsonDocument<64> doc;
+  doc["level_raw"] = levelRaw;
+
+  char buf[64];
+  serializeJson(doc, buf);
+  client.publish("esp/water_level", buf, true);
+  Serial.printf("💧 Published water level: %s\n", buf);
+}
+
+// -------------- MQTT Callback --------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+  String tl = String(topic);
+
+  // --- user commands topic -> forward to Master ---
+  if (tl.equals("home/control")) {
+    String lower = msg;
+    lower.toLowerCase();
+
+    if (lower.indexOf("light on") >= 0) {
+      Serial.println("MASTER,LO");
+    } else if (lower.indexOf("light off") >= 0) {
+      Serial.println("MASTER,LF");
+    } else if (lower.indexOf("fan on") >= 0) {
+      Serial.println("MASTER,FO");
+    } else if (lower.indexOf("fan off") >= 0) {
+      Serial.println("MASTER,FF");
+    } else if (lower.indexOf("fs") >= 0) {
+      Serial.println("MASTER,FS");
+    }
+    // ------- NEW: water motor control commands -------
+    else if (lower.indexOf("motor on") >= 0 || lower.indexOf("pump on") >= 0) {
+      Serial.println("MASTER,MOTOR_ON");
+    } else if (lower.indexOf("motor off") >= 0 || lower.indexOf("pump off") >= 0) {
+      Serial.println("MASTER,MOTOR_OFF");
+    }
+    // -------------------------------------------------
+  }
+
+  // --- thresholds topic expects JSON { "tempRef":30.5, "ldrRef":1800 } ---
+  else if (tl.equals("device/thresholds")) {
+    StaticJsonDocument<200> doc;
+    DeserializationError err = deserializeJson(doc, msg);
+    if (!err) {
+      float t = doc.containsKey("tempRef") ? doc["tempRef"].as<float>() : NAN;
+      int   l = doc.containsKey("ldrRef") ? doc["ldrRef"].as<int>() : -1;
+      if (!isnan(t) || l > 0) {
+        String out = "TH,";
+        if (!isnan(t)) out += String(t, 2);
+        out += ",";
+        if (l > 0) out += String(l);
+        Serial.println(out); // Master -> Slave via ESP-NOW
+      }
+    } else {
+      Serial.println("// TH parse error");
+    }
+  }
+
+  // --- water level request topic ---
+  else if (tl.equals("device/water")) {
+    Serial.println("MASTER,WL_REQ");
+    Serial.println("[ESP8266] Sent WL_REQ to Master");
+  }
+
+  // --- NEW: boot control topic ---
+  else if (tl.equals("device/boot")) {
+    String lower = msg;
+    lower.toLowerCase();
+
+    if (lower.indexOf("master") >= 0 && lower.indexOf("boot") >= 0) {
+      Serial.println("MASTER,BOOT_MASTER");
+      Serial.println("[ESP8266] Boot request → MASTER");
+    }
+    else if ((lower.indexOf("slave_1") >= 0 || lower.indexOf("slave1") >= 0) &&
+             lower.indexOf("boot") >= 0) {
+      Serial.println("MASTER,BOOT_S1");
+      Serial.println("[ESP8266] Boot request → SLAVE1");
+    }
+    else if ((lower.indexOf("slave_2") >= 0 || lower.indexOf("slave2") >= 0) &&
+             lower.indexOf("boot") >= 0) {
+      Serial.println("MASTER,BOOT_S2");
+      Serial.println("[ESP8266] Boot request → SLAVE2");
+    }
+  }
+}
+
+// -------------- MQTT Reconnect --------------
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect("ESP8266Client")) {
+      client.subscribe("home/control");
+      client.subscribe("device/thresholds");
+      client.subscribe("device/water");
+      client.subscribe("device/boot");   // <--- NEW
+    } else {
+      delay(2000);
+    }
+  }
+}
+
+// -------------- Sensor Publish --------------
+void publishAll() {
+  StaticJsonDocument<256> doc;
+
+  doc["temp"]  = isnan(temp) ? -1 : temp;
+  doc["hum"]   = isnan(hum) ? -1 : hum;
+  doc["ldr"]   = ldr;
+  doc["pir"]   = pir;
+  doc["ir"]    = ir;
+  doc["fault"] = (isnan(temp) || ldr <= 0);
+
+  serializeJson(doc, jsonMsg);
+  client.publish("esp/sensors", jsonMsg, true);
+  Serial.printf("📤 Published JSON: %s\n", jsonMsg);
+}
+
+// -------------- Status Publish --------------
+void publishStatus() {
+  StaticJsonDocument<128> doc;
+  doc["fan"]   = fanStatus;
+  doc["light"] = lightStatus;
+
+  char buffer[128];
+  serializeJson(doc, buffer);
+  client.publish("esp/status", buffer, true);
+  Serial.printf("📡 Published status: %s\n", buffer);
+}
+
+// -------------- Setup --------------
+void setup() {
+  Serial.begin(9600); // UART to Master
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(mqttCallback);
+}
+
+// -------------- Main Loop --------------
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  // Read UART (from Master)
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) return;
+
+    if (line.startsWith("SLAVE")) {
+      float t = NAN, h = NAN;
+      int   l = -1;
+      int parsed = sscanf(line.c_str(), "SLAVE,%f,%f,%d", &t, &h, &l);
+      if (parsed >= 3) {
+        temp = t;
+        hum  = h;
+        ldr  = l;
+      }
+      Serial.printf("[ESP8266] SLAVE data: %s\n", line.c_str());
+    }
+    else if (line.startsWith("PIRIR")) {
+      int p = 0, iv = 0;
+      int parsed = sscanf(line.c_str(), "PIRIR,%d,%d", &p, &iv);
+      if (parsed >= 2) {
+        pir = p;
+        ir  = iv;
+      }
+      Serial.printf("[ESP8266] PIR/IR: pir=%d ir=%d\n", pir, ir);
+    }
+    else if (line.startsWith("MASTER,")) {
+      int f = 0, l = 0;
+      int parsed = sscanf(line.c_str(), "MASTER,%d,%d", &f, &l);
+      if (parsed >= 2) {
+        fanStatus   = f;
+        lightStatus = l;
+      }
+      Serial.printf("[ESP8266] Status: fan=%d, light=%d\n", fanStatus, lightStatus);
+      publishStatus();
+    }
+    else if (line.startsWith("WATER,")) {
+      long level = 0;
+      int parsed = sscanf(line.c_str(), "WATER,%ld", &level);
+      if (parsed >= 1) {
+        Serial.printf("[ESP8266] Water level RAW: %ld\n", level);
+        publishWaterLevel(level);
+      }
+    }
+    else {
+      Serial.printf("[ESP8266] UART other: %s\n", line.c_str());
+    }
+  }
+
+  if (millis() - lastMsg > 2000) {
+    lastMsg = millis();
+    publishAll();
+  }
+
+  static bool fault_pub_once = false;
+  bool isFault = (isnan(temp) || ldr <= 0);
+  if (isFault && !fault_pub_once) {
+    client.publish("esp/fault", "sensor_fault");
+    fault_pub_once = true;
+  }
+  if (!isFault) fault_pub_once = false;
+}
