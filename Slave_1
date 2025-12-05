@@ -1,0 +1,288 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <DHT.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <math.h>
+
+#define DHTPIN    4
+#define DHTTYPE   DHT22
+#define LDRPIN    34
+#define FAN_PIN   22
+#define LIGHT_PIN 23
+#define OTA_BUTTON_PIN 18   // <-- PUSH BUTTON for OTA (to GND)
+
+DHT dht(DHTPIN, DHTTYPE);
+
+typedef struct struct_message {
+  float temperature;
+  float humidity;
+  int   ldrValue;
+  bool  fanState;
+  bool  lightState;
+} struct_message;
+
+struct_message myData;
+
+uint8_t masterAddress[] = {0xFC, 0xE8, 0xC0, 0x7B, 0x86, 0x8C};
+
+float tempRef = 25.0f;
+int   ldrRef  = 2000;
+
+bool fanState     = false;
+bool lightState   = false;
+bool fanUserOff   = false;
+bool lightUserOff = false;
+
+float currentTemp = NAN;
+float currentHum  = NAN;
+int   currentLdr  = -1;
+
+unsigned long lastSendTime = 0;
+const unsigned long interval = 30000UL;
+
+bool abortMode = false;
+const char* ssid     = "OPPO F19";
+const char* password = "12795073";
+
+const char* slave1FirmwareUrl =
+  "https://raw.githubusercontent.com/Nishanth1279/esp-firmware/main/Slave_ESP_1.ino.bin";
+const char* slave2FirmwareUrl =
+  "https://raw.githubusercontent.com/Nishanth1279/esp-firmware/main/Slave_ESP_2.ino.bin"; // (kept, but not used here)
+
+// -------------------- OTA --------------------
+void performFirmwareUpdate(const char* firmwareUrl) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  Serial.println("[OTA] Connecting to GitHub...");
+
+  if (http.begin(client, firmwareUrl)) {
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      int contentLength = http.getSize();
+      WiFiClient *stream = http.getStreamPtr();
+
+      if (contentLength > 0) {
+        Serial.printf("[OTA] Firmware size: %d bytes\n", contentLength);
+
+        if (!Update.begin(contentLength)) {
+          Serial.println("[OTA] Not enough space!");
+          return;
+        }
+
+        size_t written = Update.writeStream(*stream);
+        if (written == contentLength) {
+          Serial.println("[OTA] Written successfully");
+        } else {
+          Serial.printf("[OTA] Written only %d/%d bytes\n", written, contentLength);
+        }
+
+        if (Update.end()) {
+          if (Update.isFinished()) {
+            Serial.println("✅ Update finished, rebooting...");
+            delay(1000);
+            ESP.restart();
+          } else {
+            Serial.println("⚠️ Update not finished");
+          }
+        } else {
+          Serial.printf("❌ Update failed. Error: %d\n", Update.getError());
+        }
+      } else {
+        Serial.println("⚠️ Invalid content length");
+      }
+    } else {
+      Serial.printf("❌ HTTP error: %d\n", httpCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("❌ HTTP connection failed");
+  }
+}
+
+bool connectAbortWiFi() {
+  Serial.println("[BOOT] OTA trigger. Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✅ Wi-Fi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.println("\n❌ Wi-Fi connection failed.");
+  return false;
+}
+
+// -------------------- ESP-NOW RX --------------------
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len <= 0) return;
+  String cmd = String((const char*)data).substring(0, len);
+  cmd.trim();
+
+  if (cmd == "FO" || cmd == "fan_on") {
+    fanUserOff = false;
+    digitalWrite(FAN_PIN, HIGH);
+    fanState = true;
+    if (!isnan(currentTemp)) tempRef = currentTemp;
+    Serial.printf("[FAN] User ON. New tempRef = %.2f\n", tempRef);
+  }
+  else if (cmd == "FF" || cmd == "fan_off") {
+    fanUserOff = true;
+    digitalWrite(FAN_PIN, LOW);
+    fanState = false;
+    Serial.println("[FAN] User OFF. Locked OFF.");
+  }
+  else if (cmd == "LO" || cmd == "light_on") {
+    lightUserOff = false;
+    digitalWrite(LIGHT_PIN, HIGH);
+    lightState = true;
+    if (currentLdr >= 0) ldrRef = currentLdr;
+    Serial.printf("[LIGHT] User ON. New ldrRef = %d\n", ldrRef);
+  }
+  else if (cmd == "LF" || cmd == "light_off") {
+    lightUserOff = true;
+    digitalWrite(LIGHT_PIN, LOW);
+    lightState = false;
+    Serial.println("[LIGHT] User OFF. Locked OFF.");
+  }
+  else if (cmd.startsWith("TH,")) {
+    int first  = cmd.indexOf(',');
+    int second = cmd.indexOf(',', first + 1);
+    if (first > 0 && second > first) {
+      String t = cmd.substring(first + 1, second);
+      String l = cmd.substring(second + 1);
+      float tf = t.toFloat();
+      int   li = l.toInt();
+      if (tf != 0.0f) tempRef = tf;
+      if (li != 0)    ldrRef  = li;
+      Serial.printf("[CMD] Threshold update: tempRef=%.2f  ldrRef=%d\n", tempRef, ldrRef);
+    }
+  }
+  // ---------- NEW: remote BOOT command ----------
+  else if (cmd == "BOOT") {
+    Serial.println("[SLAVE1] Remote BOOT command received.");
+    abortMode = true;
+  }
+
+  Serial.printf("[SLAVE1] CMD via ESP-NOW: %s\n", cmd.c_str());
+}
+
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+
+  pinMode(FAN_PIN, OUTPUT);
+  pinMode(LIGHT_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, LOW);
+  digitalWrite(LIGHT_PIN, LOW);
+
+  pinMode(OTA_BUTTON_PIN, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, masterAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.println("Slave1 ESP32 ready. Press OTA button to update firmware.");
+}
+
+// -------------------- LOOP --------------------
+void loop() {
+
+  // OTA BUTTON CHECK
+  if (digitalRead(OTA_BUTTON_PIN) == LOW && !abortMode) {
+    Serial.println("\n[SLAVE1] OTA button pressed.");
+    abortMode = true;
+  }
+
+  if (abortMode) {
+    if (connectAbortWiFi()) {
+      Serial.println("[SLAVE1] Starting OTA...");
+      performFirmwareUpdate(slave1FirmwareUrl);   // <-- always Slave1 FW
+    }
+    abortMode = false;
+  }
+
+  // Periodic sensor + ESP-NOW
+  unsigned long now = millis();
+  if (now - lastSendTime < interval) {
+    delay(50);
+    return;
+  }
+  lastSendTime = now;
+
+  currentTemp = dht.readTemperature();
+  currentHum  = dht.readHumidity();
+  currentLdr  = analogRead(LDRPIN);
+
+  myData.temperature = currentTemp;
+  myData.humidity    = currentHum;
+  myData.ldrValue    = currentLdr;
+
+  // FAN logic
+  if (!fanUserOff && !isnan(currentTemp)) {
+    float diff = tempRef - currentTemp;
+    if (diff > 3.0f) {
+      digitalWrite(FAN_PIN, LOW);
+      fanState = false;
+      Serial.printf("[FAN] AUTO OFF | temp=%.2f ref=%.2f diff=%.2f\n",
+                    currentTemp, tempRef, diff);
+    } else {
+      digitalWrite(FAN_PIN, HIGH);
+      fanState = true;
+      Serial.printf("[FAN] AUTO ON  | temp=%.2f ref=%.2f diff=%.2f\n",
+                    currentTemp, tempRef, diff);
+    }
+  }
+
+  // LIGHT logic
+  if (!lightUserOff && currentLdr >= 0) {
+    int diffL = ldrRef - currentLdr;
+    if (diffL > 0) {
+      digitalWrite(LIGHT_PIN, LOW);
+      lightState = false;
+      Serial.printf("[LIGHT] AUTO OFF | ldr=%d ref=%d diff=%d\n",
+                    currentLdr, ldrRef, diffL);
+    } else {
+      digitalWrite(LIGHT_PIN, HIGH);
+      lightState = true;
+      Serial.printf("[LIGHT] AUTO ON  | ldr=%d ref=%d diff=%d\n",
+                    currentLdr, ldrRef, diffL);
+    }
+  }
+
+  myData.fanState   = fanState;
+  myData.lightState = lightState;
+
+  esp_err_t result = esp_now_send(masterAddress, (uint8_t*)&myData, sizeof(myData));
+  if (result == ESP_OK) {
+    Serial.printf("Sent -> Temp: %.2f Hum: %.2f LDR: %d | Fan=%d Light=%d\n",
+                  myData.temperature, myData.humidity, myData.ldrValue,
+                  fanState, lightState);
+  } else {
+    Serial.printf("Error sending data: %d\n", result);
+  }
+}
